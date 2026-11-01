@@ -1,0 +1,89 @@
+name: render-ep2
+
+# 第二期《AI 发展路线图》纯画面渲染（无音频、无实拍配图）
+# 触发：push 到 ci/ep2-render（模式读 ci/mode.txt：smoke / portrait / both），或手动 Run workflow。
+on:
+  push:
+    branches: [ci/ep2-render]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "smoke = 抽 5 帧出联系表；portrait = 竖版全片；both = 竖版 + 横版"
+        type: choice
+        options: [smoke, portrait, both]
+        default: smoke
+      end:
+        description: "正片结束时间（秒），默认 313.09（作者成片参数）"
+        default: "313.09"
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      PYTHONUNBUFFERED: "1"
+      OMP_NUM_THREADS: "1"
+      MPLBACKEND: "Agg"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (cairo / ffmpeg / fonts)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            libcairo2-dev pkg-config python3-dev ffmpeg \
+            fonts-noto-cjk fonts-noto-core fonts-liberation fonts-dejavu-core fonts-stix
+          sudo cp ci/fonts.conf /etc/fonts/conf.d/99-film.conf
+          sudo fc-cache -f
+          echo "--- font substitution (code asks for macOS fonts) ---"
+          for f in "Songti SC" "Times New Roman" "STIX Two Math"; do printf '%-18s -> ' "$f"; fc-match "$f"; done
+
+      - name: Python deps
+        run: |
+          python3 -m pip install --upgrade pip -q
+          python3 -m pip install -q pycairo numpy scipy pillow
+          python3 -c "import cairo, numpy, scipy, PIL; print('cairo', cairo.cairo_version_string(), 'numpy', numpy.__version__)"
+
+      - name: Rebuild the missing (gitignored) inputs
+        run: |
+          python3 ci/make_beats.py
+          python3 ci/make_placeholders.py
+          ffmpeg -loglevel error -y -f lavfi -i anullsrc=r=48000:cl=stereo -t 320 ai_history/bgm/bgm_v3.wav
+          ls -l ai_history/bgm/ ai_history/images/ | head -40
+
+      - name: Timeline sanity check
+        run: cd manim/scenes && python3 ai_history_film.py check
+
+      - name: Smoke frames (contact sheet) — always
+        run: |
+          cd manim/scenes
+          python3 ai_history_film.py snap 20 140 183 214 300
+
+      - name: Render (mode from ci/mode.txt)
+        run: |
+          cd manim/scenes
+          MODE=$(cat ../../ci/mode.txt 2>/dev/null || echo smoke)
+          END=$(cat ../../ci/end.txt 2>/dev/null || echo 313.09)
+          echo "mode=$MODE end=$END"
+          case "$MODE" in
+            portrait) python3 ai_history_film.py render 0 "$END" --jobs 4 --name ai_history_v7_body ;;
+            both) python3 ai_history_film.py render 0 "$END" --jobs 4 --name ai_history_v7_body
+                  AIH_ORIENT=landscape python3 ai_history_film.py render 0 "$END" --jobs 4 --name ai_history_v7_bili_body ;;
+            *) echo "smoke only" ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ep2-${{ github.run_id }}-frames
+          path: ai_history/film_out/snaps*/**/*.png
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ hashFiles('ai_history/film_out/*.mp4') != '' }}
+        with:
+          name: ep2-${{ github.run_id }}-video
+          path: |
+            ai_history/film_out/ai_history_v7_body.mp4
+            ai_history/film_out/ai_history_v7_bili_body.mp4
+          if-no-files-found: warn
+          compression-level: 0
